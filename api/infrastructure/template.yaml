@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: NL-to-SQL Engine - Serverless API powered by Bedrock and Athena
+ 
+# ── Global settings applied to ALL Lambda functions ──────────
+Globals:
+  Function:
+    Timeout: 120
+    MemorySize: 256
+    Runtime: python3.13
+    Environment:
+      Variables:
+        ATHENA_DATABASE:  nl_sql_db
+        ATHENA_TABLE:     sales
+        RESULTS_BUCKET:   !Sub 'nl-sql-athena-results-${AWS::AccountId}'
+        DATA_BUCKET:      !Sub 'nl-sql-data-${AWS::AccountId}'
+        BEDROCK_MODEL_ID: anthropic.claude-3-sonnet-20240229-v1:0
+        BEDROCK_REGION:   us-east-1
+ 
+# ── Resources — the actual AWS things to create ──────────────
+Resources:
+ 
+  # The Lambda function
+  QueryHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: nl-sql-query-handler
+      CodeUri: ../src/query_handler/
+      Handler: app.lambda_handler
+      Description: Converts natural language to SQL and queries Athena
+      Policies:
+        - AmazonBedrockFullAccess
+        - AmazonAthenaFullAccess
+        - AmazonS3FullAccess
+      Events:
+        QueryApi:
+          Type: Api
+          Properties:
+            Path: /query
+            Method: POST
+        HealthApi:
+          Type: Api
+          Properties:
+            Path: /health
+            Method: GET
+ 
+# ── Outputs — values printed after deployment ─────────────────
+Outputs:
+  ApiEndpoint:
+    Description: Live API Gateway URL for the NL-to-SQL engine
+    Value: !Sub 'https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/query'
+  HealthEndpoint:
+    Description: Health check URL
+    Value: !Sub 'https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/health'
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref QueryHandlerFunction
