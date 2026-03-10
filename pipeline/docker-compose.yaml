@@ -1,41 +1,35 @@
 # ign-data-platform/pipeline/docker-compose.yaml
 #
-# Airflow stack optimised for a single EC2 instance (t3.medium or larger).
-# Uses CeleryExecutor with Redis as the message broker.
+# Airflow stack optimised for a t3.small EC2 instance (2GB RAM).
+# Uses LocalExecutor — the scheduler runs tasks directly, no Celery or Redis needed.
+# This is perfectly suitable for a single DAG running daily.
 #
 # Services:
-#   postgres       — Airflow metadata database (task states, DAG runs, logs)
-#   redis          — Celery message broker (task queue between scheduler and worker)
-#   airflow-init   — One-time init: DB migration + admin user creation
+#   postgres          — Airflow metadata database (task states, DAG runs, logs)
+#   airflow-init      — One-time init: DB migration + admin user creation
 #   airflow-webserver — UI on port 8080
-#   airflow-scheduler — Parses DAGs and triggers task instances on schedule
-#   airflow-worker    — Executes the actual task code
+#   airflow-scheduler — Parses DAGs, triggers tasks, AND executes them (LocalExecutor)
 #
 # Usage:
-#   docker compose up -d           # Start all services
-#   docker compose down            # Stop all services
-#   docker compose logs -f worker  # Tail worker logs
+#   docker compose up -d              # Start all services
+#   docker compose down               # Stop all services
+#   docker compose logs -f scheduler  # Tail scheduler/task logs
 
 ---
 x-airflow-common: &airflow-common
-  build: .                          # Builds from local Dockerfile
+  build: .
   env_file:
-    - .env                          # Reads secrets from .env file
+    - .env
   environment: &airflow-common-env
     # --- Airflow core ---
-    AIRFLOW__CORE__EXECUTOR:                  CeleryExecutor
-    AIRFLOW__CORE__FERNET_KEY:                ${FERNET_KEY}
+    AIRFLOW__CORE__EXECUTOR:                    LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY:                  ${FERNET_KEY}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
-    AIRFLOW__CORE__LOAD_EXAMPLES:             "false"
+    AIRFLOW__CORE__LOAD_EXAMPLES:               "false"
 
     # --- Database (Airflow metadata) ---
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
       postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
-
-    # --- Celery ---
-    AIRFLOW__CELERY__RESULT_BACKEND: >-
-      db+postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
-    AIRFLOW__CELERY__BROKER_URL:     redis://:@redis:6379/0
 
     # --- API auth ---
     AIRFLOW__API__AUTH_BACKENDS: >-
@@ -45,36 +39,31 @@ x-airflow-common: &airflow-common
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
 
     # --- Airflow Variables (injected from .env) ---
-    # These are picked up by Variable.get() at runtime
-    AIRFLOW_VAR_YT_API_KEY:         ${YT_API_KEY}
-    AIRFLOW_VAR_YT_CHANNEL_HANDLE:  ${YT_CHANNEL_HANDLE}
-    AIRFLOW_VAR_S3_BUCKET:          ${S3_BUCKET}
-    AIRFLOW_VAR_S3_KEY:             ${S3_KEY}
-    AIRFLOW_VAR_AWS_REGION:         ${AWS_REGION}
-    AIRFLOW_VAR_GLUE_CRAWLER_NAME:  ${GLUE_CRAWLER_NAME}
+    AIRFLOW_VAR_YT_API_KEY:        ${YT_API_KEY}
+    AIRFLOW_VAR_YT_CHANNEL_HANDLE: ${YT_CHANNEL_HANDLE}
+    AIRFLOW_VAR_S3_BUCKET:         ${S3_BUCKET}
+    AIRFLOW_VAR_S3_KEY:            ${S3_KEY}
+    AIRFLOW_VAR_AWS_REGION:        ${AWS_REGION}
+    AIRFLOW_VAR_GLUE_CRAWLER_NAME: ${GLUE_CRAWLER_NAME}
 
     # --- AWS credentials (used by boto3 in tasks) ---
-    AWS_ACCESS_KEY_ID:              ${AWS_ACCESS_KEY_ID}
-    AWS_SECRET_ACCESS_KEY:          ${AWS_SECRET_ACCESS_KEY}
-    AWS_DEFAULT_REGION:             ${AWS_REGION}
+    AWS_ACCESS_KEY_ID:     ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    AWS_DEFAULT_REGION:    ${AWS_REGION}
 
   volumes:
-    - ./dags:/opt/airflow/dags       # DAG files hot-reload without restart
-    - ./logs:/opt/airflow/logs       # Persistent task logs
-    - ./plugins:/opt/airflow/plugins # Custom Airflow plugins (empty for now)
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
 
   user: "${AIRFLOW_UID:-50000}:0"
 
   depends_on: &airflow-depends-on
     postgres:
       condition: service_healthy
-    redis:
-      condition: service_healthy
 
 # ---------------------------------------------------------------------------
 services:
-
-  # ---------- Infrastructure ----------
 
   postgres:
     image: postgres:15
@@ -91,21 +80,6 @@ services:
       retries:      5
       start_period: 5s
     restart: always
-
-  redis:
-    image: redis:7.2-bookworm
-    container_name: airflow-redis
-    expose:
-      - 6379
-    healthcheck:
-      test:         ["CMD", "redis-cli", "ping"]
-      interval:     10s
-      timeout:      30s
-      retries:      50
-      start_period: 30s
-    restart: always
-
-  # ---------- Airflow ----------
 
   airflow-init:
     <<: *airflow-common
@@ -125,13 +99,11 @@ services:
         echo "Airflow initialised successfully."
     environment:
       <<: *airflow-common-env
-      _AIRFLOW_DB_MIGRATE:       "true"
-      _AIRFLOW_WWW_USER_CREATE:  "true"
+      _AIRFLOW_DB_MIGRATE:      "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
     user: "0:0"
     depends_on:
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
 
   airflow-webserver:
@@ -161,27 +133,6 @@ services:
       interval:     30s
       timeout:      10s
       retries:      5
-      start_period: 30s
-    restart: always
-    depends_on:
-      <<: *airflow-depends-on
-      airflow-init:
-        condition: service_completed_successfully
-
-  airflow-worker:
-    <<: *airflow-common
-    container_name: airflow-worker
-    command: celery worker
-    environment:
-      <<: *airflow-common-env
-      DUMB_INIT_SETSID: "0"   # Proper signal handling for graceful shutdown
-    healthcheck:
-      test:
-        - "CMD-SHELL"
-        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
-      interval: 30s
-      timeout:  10s
-      retries:  5
       start_period: 30s
     restart: always
     depends_on:
